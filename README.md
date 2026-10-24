@@ -41,17 +41,21 @@ chmod 600 /etc/cluster-update-cycle.conf
 @reboot sleep 30 && /usr/local/sbin/cluster-update-cycle.sh resume
 ```
 
-Both lines are safe to put on every node in the cluster: `start` takes a cluster-wide
-lock (`/etc/pve/priv/cluster-update-cycle.owner`) so only one node actually drives a
-cycle, and `resume` exits immediately unless this node has a cycle waiting on it.
+Both lines are safe to put on every node in the cluster, even firing in the same
+minute: `start` claims the cycle by creating `/etc/pve/priv/cluster-update-cycle.lock`,
+which only one node can do (pmxcfs orders all writes cluster-wide, and refuses them on
+a node without quorum). The other nodes see it and exit. `resume` exits immediately
+unless this node has a cycle waiting on it.
 
 ## Usage
 
 ```
-cluster-update-cycle.sh start    # begin (or resume) a cycle
-cluster-update-cycle.sh resume   # resume after a self-reboot (meant for @reboot)
-cluster-update-cycle.sh plan     # read-only: what a cycle started now would do
-cluster-update-cycle.sh status   # current cycle state + plan
+cluster-update-cycle.sh start          # begin a cycle (no-op if one is running or blocked)
+cluster-update-cycle.sh resume         # resume after a self-reboot (meant for @reboot)
+cluster-update-cycle.sh clear          # unblock cycles after you've dealt with a failure
+cluster-update-cycle.sh clear --force  # also clear a record that still says "running"
+cluster-update-cycle.sh plan           # read-only: what a cycle started now would do
+cluster-update-cycle.sh status         # cycle record, local state + plan
 ```
 
 Run `plan` any time to sanity-check your config — it reports quorum safety, which
@@ -106,13 +110,39 @@ specific payload shape (Slack's `{"text": ...}`, Discord's `{"content": ...}`) n
 a small transform in between — point `WEBHOOK_URL` at that instead of the service
 directly.
 
-## State
+## State and recovery
 
-Cycle state lives in `/var/lib/cluster-update-cycle/state` and survives across the
-self-reboot so `resume` can pick back up. `status` prints it raw alongside the plan.
-If a cycle is interrupted (crash, manual abort), the next `start` logs that and
-begins a fresh cycle — nodes already confirmed rebooted are detected again via
-`pvecm`/kernel version and skipped.
+The script does the normal case on its own and calls for help when something is
+unclear. It does not try to repair a half-finished cycle.
+
+- **Cluster cycle record**: `/etc/pve/priv/cluster-update-cycle.lock/record`
+  (owner node, cycle ID, `running` or `failed`, reason). It exists from the start of a
+  cycle until the cycle succeeds. Every node can see it.
+- **Local state**: `/var/lib/cluster-update-cycle/state` on the driving node. It
+  survives the self-reboot so `resume` can pick back up.
+
+How failures are handled:
+
+- **Failure before anything changed** (quorum pre-flight, the package-removal check,
+  a node that can't be reached): failure notification, record removed, and the next
+  scheduled run tries again.
+- **Failure after something changed** (upgrade, evacuation, reboot, rejoin, finish):
+  the record is marked `failed` and left in place. Every node's `start` then refuses
+  to run, and the driving node re-sends the failure notification on each scheduled
+  run (any node does, if the driving node is offline). Fix what's wrong, then run
+  `clear`. It lists nodes still in HA maintenance and parked guests that aren't
+  running, but does not change them.
+- **Interrupted cycle** (crash, kill, power loss): the next `start` on the driving
+  node marks it `failed`, as above. If the driving node is offline for more than 6
+  hours while the record says `running`, the other nodes start sending notifications;
+  use `clear --force` once you've checked.
+- **Record no longer ours**: the driving node checks before each node and before
+  resuming. If someone cleared or replaced the record, the driving node stops without
+  changing anything else.
+
+No node ever takes over another node's cycle. A new cycle can start on any node once
+the previous one succeeded or was cleared. It re-detects which nodes need a reboot,
+and starts any parked guests again at its end.
 
 ## Safety notes
 
@@ -123,4 +153,18 @@ begins a fresh cycle — nodes already confirmed rebooted are detected again via
   cycle halts without rebooting the affected node and leaves everything else as-is
   for manual review (see the failure notification / log for why).
 - Parked guests (`PARK_SIDS`) are only restarted if the rest of the cycle succeeded;
-  otherwise they're left stopped and the failure notification says so.
+  otherwise they're left stopped and the failure notification says so. Restarting is
+  checked: a parked guest that doesn't reach `running` fails the cycle.
+- Before upgrading anything, every node simulates the upgrade (`apt-get -s
+  dist-upgrade`). If any node would remove a package (the classic case is broken
+  repositories removing `proxmox-ve`), the cycle stops with nothing upgraded. The real
+  upgrade also runs with `--no-remove`. `autoremove` is never run; clean up old
+  kernels and packages yourself.
+- Reboot detection has three outcomes: needed, not needed, and couldn't tell (which
+  stops the cycle). It uses `needrestart` when that gives a usable answer, and
+  otherwise compares the running kernel with the newest one in `/boot`. If you pin
+  an older kernel with `proxmox-boot-tool kernel pin` and don't have `needrestart`,
+  that comparison reports a reboot every time.
+- A reboot that is requested but never happens (the command fails, or the node never
+  goes down) is reported as such, not as a timeout. If the node is clearly still up,
+  its HA maintenance is turned off before the cycle fails.
