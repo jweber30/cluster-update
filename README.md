@@ -1,10 +1,14 @@
 # cluster-update-cycle
 
+> **Work in progress.** This is a concept I run on my own three-node homelab
+> cluster. It hasn't been tested widely, so read it before you trust it with yours.
+> Feedback, issues and suggestions are welcome.
+
 Built with Claude Sonnet 5 and Opus 5.5.
 
 Rolling package update and reboot cycle for a Proxmox VE cluster of any size.
 
-Run from cron on one cluster node. It upgrades packages on every node, then reboots
+Run from cron (on every node; one of them drives each cycle). It upgrades packages on every node, then reboots
 the nodes that need it one at a time: HA maintenance mode evacuates the node, any
 guests you've marked critical are confirmed healthy elsewhere, the node reboots and
 rejoins, and HA is left to settle before moving to the next node. The node running
@@ -259,3 +263,8 @@ and starts any parked guests again at its end.
 - A reboot that is requested but never happens (the command fails, or the node never
   goes down) is reported as such, not as a timeout. If the node is clearly still up,
   its HA maintenance is turned off before the cycle fails.
+
+## License
+
+MIT; see [LICENSE](LICENSE). The task helper loads Proxmox VE's own Perl modules
+(AGPL-3.0) at runtime; none of Proxmox's code is included in this repository.

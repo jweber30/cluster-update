@@ -439,13 +439,17 @@ unpark_guests() {
 # Sends the webhook (if configured) and records a task in the PVE task list, both
 # best effort. <event> is one of start, reboot, result (the default) or blocked.
 notify() {
-  local status="$1" message="$2" event="${3:-result}" payload
+  local status="$1" message="$2" event="${3:-result}" payload url
   [ "$status" = failure ] && [ "${PARKED:-0}" = 1 ] && message="$message Parked guests may still be stopped: ${PARK_SIDS[*]}."
   if [ -n "$WEBHOOK_URL" ]; then
     payload=$(jq -n --arg status "$status" --arg event "$event" --arg message "$message" \
       --arg cycle "${CYCLE_ID:-none}" --arg node "$SELF_NODE" --arg time "$(date -Is)" \
       '{status:$status, event:$event, message:$message, cycle_id:$cycle, node:$node, time:$time}')
-    curl -fsS -m 15 -X POST -H "Content-Type: application/json" -d "$payload" "$WEBHOOK_URL" >/dev/null 2>&1 \
+    # The URL goes in through a curl config on stdin, not the command line, so it
+    # doesn't show up in ps.
+    url=${WEBHOOK_URL//\\/\\\\}; url=${url//\"/\\\"}
+    curl -fsS -m 15 -X POST -H "Content-Type: application/json" -d "$payload" -K - \
+      <<<"url = \"$url\"" >/dev/null 2>&1 \
       || log "WARN: webhook notification failed to send (status=$status)"
   fi
   record_task "$status" "$event" "$message"
