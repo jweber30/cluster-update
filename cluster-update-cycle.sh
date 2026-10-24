@@ -14,6 +14,8 @@
 # Site settings live in /etc/cluster-update-cycle.conf; see the example file.
 
 set -uo pipefail
+# cron's default PATH lacks /usr/sbin, where ha-manager, qm, reboot and needrestart live.
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 CONF_FILE="${CLUSTER_UPDATE_CYCLE_CONF:-/etc/cluster-update-cycle.conf}"
 
@@ -41,6 +43,7 @@ LOG_FILE="/var/log/cluster-update-cycle.log"
 CYCLE_DIR="/etc/pve/priv/cluster-update-cycle.lock"
 RECORD="$CYCLE_DIR/record"
 MEMBERS="/etc/pve/.members"
+PVE_NODES_DIR="/etc/pve/nodes"
 HA_MANAGER_STATUS="/etc/pve/ha/manager_status"
 HA_RESOURCES="/etc/pve/ha/resources.cfg"
 
@@ -296,6 +299,63 @@ wait_for_ha_settled() {
   done
 }
 
+# retry <timeout> <command...>: run the command every 5s until it succeeds or the
+# timeout passes. The command's own REASON from the last attempt is kept.
+retry() {
+  local timeout="$1" waited=0; shift
+  until "$@"; do
+    sleep 5; waited=$((waited+5))
+    [ "$waited" -ge "$timeout" ] && return 1
+  done
+  return 0
+}
+
+# units_active <node> <unit...>: every listed systemd unit is active on <node>.
+units_active() {
+  local node="$1" bad; shift
+  bad=$(run_on "$node" "for u in $*; do systemctl is-active --quiet \$u || echo \$u; done") \
+    || { REASON="could not reach $node to check its services"; return 1; }
+  [ -z "$bad" ] && return 0
+  REASON="not active on $node: ${bad//$'\n'/ }"
+  return 1
+}
+
+# The node's HA agent (LRM) has written its status since <epoch>. It does so every
+# few seconds whether or not it runs any services, so a stale timestamp means it is
+# hung or not running.
+lrm_reported_since() {
+  local node="$1" since="$2" ts
+  ts=$(jq -r '.timestamp // empty' "$PVE_NODES_DIR/$node/lrm_status" 2>/dev/null)
+  ts=${ts%.*}
+  [ -n "$ts" ] && [ "$ts" -gt "$since" ] 2>/dev/null && return 0
+  REASON="HA agent (LRM) on $node has not reported since its upgrade (last timestamp: ${ts:-none})"
+  return 1
+}
+
+# Health of <node> right after its packages were upgraded at <epoch>. Package
+# scripts restart these daemons, so a broken update shows up here. Sets REASON.
+check_node_after_upgrade() {
+  local node="$1" since="$2" units="corosync pve-cluster"
+  ha_in_use && units="$units pve-ha-lrm pve-ha-crm"
+  retry 60 units_active "$node" $units || return 1
+  retry 60 quorum_allows_reboot || return 1
+  if ha_in_use; then
+    retry 120 lrm_reported_since "$node" "$since" || return 1
+    wait_for_ha_settled || { REASON="HA did not settle"; return 1; }
+  fi
+  log "$node healthy after its upgrade"
+}
+
+# "Upgraded: a b. Failed on: c. Not upgraded: d e." for failure messages.
+upgrade_progress() {
+  local failed="$1" upgraded="$2" n rest=""
+  for n in $(cluster_nodes); do
+    in_list "$n" "$upgraded $failed" || rest="$rest $n"
+  done
+  upgraded=${upgraded# }; rest=${rest# }
+  echo "Upgraded: ${upgraded:-none}. Failed on: $failed. Not upgraded: ${rest:-none}."
+}
+
 evacuate_node() {
   local node="$1" waited=0 left
   ha_in_use || return 0
@@ -532,7 +592,7 @@ take_lock() {
 }
 
 cmd_start() {
-  local n out rc
+  local n out rc upgraded started
   take_lock || { log "Another cycle is already running here; exiting"; exit 0; }
   load_state
   check_existing_cycle
@@ -563,12 +623,18 @@ cmd_start() {
     esac
   done
 
+  # One node at a time, checking health after each, so a bad cluster or HA package
+  # stops at the first node instead of reaching all of them.
+  upgraded=""
   for n in $(cluster_nodes); do
     log "Upgrading packages on $n"
-    run_on "$n" "$APT_UPGRADE_CMD" || fail "Package upgrade failed on $n; nodes before it in the list are already upgraded. Nothing rebooted."
+    started=$(date +%s)
+    run_on "$n" "$APT_UPGRADE_CMD" \
+      || fail "Package upgrade failed on $n. $(upgrade_progress "$n" "$upgraded") Nothing rebooted."
+    check_node_after_upgrade "$n" "$started" \
+      || fail "$n is unhealthy after its package upgrade ($REASON). $(upgrade_progress "$n" "$upgraded") Nothing rebooted."
+    upgraded="$upgraded $n"
   done
-  # Upgrading the HA packages restarts the HA daemons and briefly freezes services.
-  wait_for_ha_settled || fail "HA did not settle after package upgrades. Nothing rebooted."
 
   # Peers first, self last, so the resume-after-self-reboot path runs at most once.
   for n in $(cluster_nodes | grep -vx "$SELF_NODE") $(cluster_nodes | grep -x "$SELF_NODE"); do

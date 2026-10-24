@@ -14,8 +14,10 @@ the script goes last and resumes after its own reboot via an `@reboot` cron entr
 
 - Proxmox VE cluster (tested on a cluster; a single standalone node has no HA/quorum
   concerns the script cares about, but it should still run)
-- `jq`, `flock`, `pvecm`, `pvesh`, `ha-manager` on the node(s) running the script
-  (all present on a standard PVE install)
+- `jq`, `flock`, `pvecm`, `pvesh`, `ha-manager` on every node that may run the script.
+  All but `jq` come with PVE; `jq` isn't always installed (`apt install jq`).
+- Optional: `needrestart` for more precise reboot detection. Without it, the script
+  compares the running kernel with the newest installed one.
 - Passwordless root SSH between nodes using PVE's own cluster host keys — this is
   already set up by Proxmox cluster join, nothing extra to configure
 - Run as root, since `ha-manager`/`pvesh` and `/etc/pve/priv` require it
@@ -33,12 +35,14 @@ chmod 600 /etc/cluster-update-cycle.conf
 
 ### Cron
 
+As `/etc/cron.d/cluster-update-cycle` on each node:
+
 ```cron
-# Kick off a cycle, e.g. weekly
-17 3 * * 0 /usr/local/sbin/cluster-update-cycle.sh start
+# Kick off a cycle: Sundays at 04:00
+0 4 * * 0 root /usr/local/sbin/cluster-update-cycle.sh start
 
 # Resume a cycle after this node reboots itself
-@reboot sleep 30 && /usr/local/sbin/cluster-update-cycle.sh resume
+@reboot root sleep 30 && /usr/local/sbin/cluster-update-cycle.sh resume
 ```
 
 Both lines are safe to put on every node in the cluster, even firing in the same
@@ -46,6 +50,40 @@ minute: `start` claims the cycle by creating `/etc/pve/priv/cluster-update-cycle
 which only one node can do (pmxcfs orders all writes cluster-wide, and refuses them on
 a node without quorum). The other nodes see it and exit. `resume` exits immediately
 unless this node has a cycle waiting on it.
+
+### Scheduling and supervision
+
+Schedule cycles shortly before a time when an administrator will be around to check
+the cluster and fix problems. Package upgrades restart services, and rolling reboots
+temporarily reduce cluster capacity. The cycle runs unattended, but that doesn't
+make it risk-free.
+
+- **How often.** Weekly is a reasonable default for many homelabs. For urgent
+  security updates, run `cluster-update-cycle.sh start` by hand; it works at any
+  time.
+- **Supervise the first run.** After installing or changing the config, run `plan`
+  on each node, then run `start` by hand and watch
+  `/var/log/cluster-update-cycle.log` on that node.
+- **Make sure notifications reach you.** A failure you never hear about is the worst
+  outcome. Send a sample payload to the webhook with `curl` and confirm it arrives
+  somewhere you'll see it.
+- **Avoid backup windows.** A guest being backed up by `vzdump` is locked and can't
+  be migrated, so evacuation times out and the cycle stops. That fails safely, but
+  it needlessly costs you a week. Leave a margin after your longest backup job.
+- **Use the same timezone on every node.** Cron uses local time.
+- **Major PVE upgrades (e.g. 8 → 9)** are a manual job. Comment out the cron line
+  while you do one. The removal check usually catches a half-switched repository,
+  but don't rely on it.
+
+Cron entries don't need staggering for correctness; the lock handles that. You can
+still stagger them by a few minutes to give a preferred node the first chance to
+take the lock. Then you know which node's log to read. This is an operational
+preference, not a safety requirement.
+
+Keep the `@reboot` resume entry on every node that can start a cycle. Watch for
+failure notifications, and make sure someone has looked into a failed cycle before
+its record is cleared. The log is on the node that drove the cycle (the `owner` in
+`status`).
 
 ## Usage
 
@@ -164,6 +202,18 @@ and starts any parked guests again at its end.
   repositories removing `proxmox-ve`), the cycle stops with nothing upgraded. The real
   upgrade also runs with `--no-remove`. `autoremove` is never run; clean up old
   kernels and packages yourself.
+- Nodes are upgraded one at a time, with a health check after each one before the
+  next starts. A bad `corosync`, `pve-cluster` or HA package therefore stops at the
+  first node instead of reaching all of them. The check:
+  - `corosync` and `pve-cluster` are active, plus `pve-ha-lrm` and `pve-ha-crm` when
+    HA is in use;
+  - the cluster is quorate with all nodes and votes present;
+  - the node's HA agent (LRM) has reported since its upgrade;
+  - HA has settled.
+
+  A failure stops the cycle (sticky, like other failures after a change), and the
+  notification lists which nodes were and weren't upgraded. The check adds roughly
+  30–60 seconds per node.
 - Reboot detection has three outcomes: needed, not needed, and couldn't tell (which
   stops the cycle). It uses `needrestart` when that gives a usable answer, and
   otherwise compares the running kernel with the newest one in `/boot`. If you pin
