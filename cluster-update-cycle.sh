@@ -166,12 +166,15 @@ owns_record() {
   [ "$(record_get owner)" = "$SELF_NODE" ] && [ "$(record_get cycle)" = "$CYCLE_ID" ]
 }
 
-# Atomically claim the cycle. Fails if any node already holds it, or /etc/pve is not
-# writable (no quorum).
+# Atomically claim the cycle. Returns 1 if another node holds it or /etc/pve is not
+# writable (no quorum), 2 if we created the lock but could not write the record (the
+# lock is removed again, partial record included).
 acquire_cycle() {
   mkdir "$CYCLE_DIR" 2>/dev/null || return 1
-  write_record running || { rmdir "$CYCLE_DIR" 2>/dev/null; return 1; }
-  owns_record
+  write_record running && owns_record && return 0
+  rm -f "$RECORD"
+  rmdir "$CYCLE_DIR" 2>/dev/null || log "WARN: could not remove $CYCLE_DIR after a failed claim"
+  return 2
 }
 release_cycle() {
   owns_record || return 0
@@ -538,10 +541,13 @@ cmd_start() {
   PHASE="preflight"; PENDING=""; DONE=""; CURRENT=""; PARKED=0
   save_state
   quorum_allows_reboot || fail_clean "Pre-flight failed: $REASON."
-  if ! acquire_cycle; then
-    if [ -d "$CYCLE_DIR" ]; then log "Another node claimed the cycle first; exiting"; exit 0; fi
-    fail_clean "Pre-flight failed: cannot write the cycle record to /etc/pve."
-  fi
+  acquire_cycle
+  case $? in
+    0) ;;
+    1) if [ -d "$CYCLE_DIR" ]; then log "Another node claimed the cycle first; exiting"; exit 0; fi
+       fail_clean "Pre-flight failed: cannot create the cycle lock in /etc/pve." ;;
+    *) fail_clean "Pre-flight failed: created the cycle lock but could not write its record.$([ -d "$CYCLE_DIR" ] && echo " The lock could not be removed either; run 'cluster-update-cycle.sh clear'.")" ;;
+  esac
   PHASE="updating"; save_state
   log "=== Starting update cycle $CYCLE_ID on $SELF_NODE; nodes: $(cluster_nodes | tr '\n' ' ')==="
 
@@ -600,19 +606,42 @@ cmd_resume() {
   advance
 }
 
+# Is a start/resume process running on <node>? It holds the local flock for its whole
+# run. Returns 0 = no, 1 = yes, 2 = could not tell (node unreachable).
+controller_state() {
+  run_on "$1" "[ -e '$LOCK_FILE' ] || exit 0; flock -n '$LOCK_FILE' true" 2>/dev/null
+  case $? in 0) return 0 ;; 1) return 1 ;; *) return 2 ;; esac
+}
+
 # Remove the cluster cycle record after a failure has been dealt with.
 cmd_clear() {
-  local force="${1:-}" status cycle n sid st
+  local force="${1:-}" status cycle owner answer n sid st
   take_lock || { echo "A cycle is running on this node right now; refusing to clear." >&2; exit 1; }
   if [ ! -d "$CYCLE_DIR" ]; then
     echo "No cycle record; nothing to clear."
   else
     echo "-- cycle record ($RECORD) --"
     cat "$RECORD" 2>/dev/null || echo "(empty)"
-    status=$(record_get status); cycle=$(record_get cycle)
-    if [ "$status" = running ] && [ "$force" != --force ]; then
-      echo "The record says this cycle is still running. If you are sure no node is working on it, run: $0 clear --force" >&2
-      exit 1
+    status=$(record_get status); cycle=$(record_get cycle); owner=$(record_get owner)
+    if [ "$status" = running ]; then
+      if [ "$force" != --force ]; then
+        echo "The record says this cycle is still running. If you are sure no node is working on it, run: $0 clear --force" >&2
+        exit 1
+      fi
+      # On this node our own flock already proved nothing is running. Elsewhere, ask.
+      if [ "$owner" != "$SELF_NODE" ]; then
+        controller_state "$owner"
+        case $? in
+          0) echo "$owner is reachable and no cycle process is running there; clearing." ;;
+          1) echo "REFUSING: cluster-update-cycle.sh is running on $owner right now (it holds $LOCK_FILE there). Stop it on $owner first." >&2
+             exit 1 ;;
+          *) echo "WARNING: could not reach $owner to check whether cycle $cycle is still running there." >&2
+             echo "WARNING: if it is (for example, rebooting itself), clearing lets another cycle start alongside it." >&2
+             [ -t 0 ] || { echo "Not running on a terminal; refusing. Run clear interactively to confirm." >&2; exit 1; }
+             read -r -p "Type the cycle id ($cycle) to clear anyway: " answer
+             [ "$answer" = "$cycle" ] || { echo "Not cleared." >&2; exit 1; } ;;
+        esac
+      fi
     fi
     rm -f "$RECORD"
     rmdir "$CYCLE_DIR" || { echo "Could not remove $CYCLE_DIR (is the cluster quorate?)" >&2; exit 1; }

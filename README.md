@@ -136,6 +136,10 @@ How failures are handled:
   node marks it `failed`, as above. If the driving node is offline for more than 6
   hours while the record says `running`, the other nodes start sending notifications;
   use `clear --force` once you've checked.
+- **`clear --force` from another node** checks the owner node over SSH first. If a
+  `start` or `resume` is running there (it holds the local lock), `clear` refuses. If
+  the owner can't be reached, `clear` warns and asks you to type the cycle ID. It
+  refuses when not run on a terminal.
 - **Record no longer ours**: the driving node checks before each node and before
   resuming. If someone cleared or replaced the record, the driving node stops without
   changing anything else.
