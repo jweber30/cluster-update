@@ -25,8 +25,8 @@ the script goes last and resumes after its own reboot via an `@reboot` cron entr
 ## Install
 
 ```sh
-cp cluster-update-cycle.sh /usr/local/sbin/
-chmod 750 /usr/local/sbin/cluster-update-cycle.sh
+cp cluster-update-cycle.sh cluster-update-cycle-task /usr/local/sbin/
+chmod 750 /usr/local/sbin/cluster-update-cycle.sh /usr/local/sbin/cluster-update-cycle-task
 
 cp cluster-update-cycle.conf.example /etc/cluster-update-cycle.conf
 chmod 600 /etc/cluster-update-cycle.conf
@@ -127,26 +127,63 @@ automatically after a reboot, planned or not.
 
 ## Notifications
 
-If `WEBHOOK_URL` is set, the script POSTs a plain JSON body at the start, end, and
-on failure of a cycle:
+Every event goes to up to three places, all on a best-effort basis: a failure to
+notify is logged and never stops a cycle.
+
+### Syslog
+
+The output of `start` and `resume` (the script's own lines and apt's) goes to
+`/var/log/cluster-update-cycle.log` and to the systemd journal, tagged
+`cluster-update-cycle`. The journal is what **Node → System → Syslog** shows in the
+PVE GUI. From a shell:
+
+```sh
+journalctl -t cluster-update-cycle --since today
+```
+
+### Task list
+
+If `cluster-update-cycle-task` is installed (in `/usr/local/sbin`, like the script), each event also
+creates a short task in the PVE task list on the driving node:
+
+| Task type | When | Status |
+|---|---|---|
+| `cluster-update-start` | a cycle starts | OK |
+| `cluster-update-reboot` | the driving node is about to reboot itself | OK |
+| `cluster-update-result` | the cycle ends | OK, or failed with the reason |
+| `cluster-update-blocked` | `start` refused because an earlier cycle needs attention | failed with the reason |
+
+The task ID is the cycle ID. Opening a `result` task shows this cycle's log lines
+(up to 500) and where to find the full log. The tasks last a second or two, so a
+reboot can't interrupt them and they have no Stop button that could abort a cycle.
+
+The helper uses Proxmox's internal Perl API (`PVE::RPCEnvironment::fork_worker`),
+which comes with no compatibility promise. If an update ever breaks it, the log
+shows `WARN: could not record a task` and everything else carries on. Delete the
+helper to turn this off.
+
+### Webhook
+
+If `WEBHOOK_URL` is set, the script POSTs a plain JSON body for the same events:
 
 ```json
 {
   "status": "success",
-  "message": "Cluster update cycle complete. cycle=20260101-030000 quorum=OK rebooted=[pve2 pve3] critical:vm:104=running@pve1",
-  "cycle_id": "20260101-030000",
+  "event": "result",
+  "message": "Cluster update cycle complete. cycle=20260101-040000 quorum=OK rebooted=[pve2 pve3] critical:vm:104=running@pve1",
+  "cycle_id": "20260101-040000",
   "node": "pve1",
-  "time": "2026-01-01T03:17:42-05:00"
+  "time": "2026-01-01T04:17:42-07:00"
 }
 ```
 
-`status` is one of `info`, `success`, or `failure`. This isn't shaped for any one
-notification service — it's a generic JSON object, so it works with anything that
-can receive a webhook and inspect fields: a Home Assistant `webhook` automation
-trigger, Node-RED, n8n, a small receiving script, etc. Services that expect a
-specific payload shape (Slack's `{"text": ...}`, Discord's `{"content": ...}`) need
-a small transform in between — point `WEBHOOK_URL` at that instead of the service
-directly.
+`status` is one of `info`, `success`, or `failure`, and `event` is one of `start`,
+`reboot`, `result`, or `blocked`. This isn't shaped for any one notification
+service. It's a generic JSON object, so it works with anything that can receive a
+webhook and inspect fields: a Home Assistant `webhook` automation trigger, Node-RED,
+n8n, a small receiving script, and so on. Services that expect a specific payload
+shape (Slack's `{"text": ...}`, Discord's `{"content": ...}`) need a small transform
+in between; point `WEBHOOK_URL` at that instead of the service directly.
 
 ## State and recovery
 

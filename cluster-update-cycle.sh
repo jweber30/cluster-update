@@ -120,7 +120,7 @@ apt-get update -qq || exit 1
 sim=$(apt-get -s -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold dist-upgrade 2>&1) || { printf "%s\n" "$sim" | tail -n5; exit 1; }
 rm=$(printf "%s\n" "$sim" | awk "/^Remv / { printf \"%s \", \$2 }")
 [ -z "$rm" ] && exit 0
-echo "REMOVE: $rm"
+echo "REMOVE: ${rm% }"
 exit 3
 '
 # --no-remove makes apt abort rather than remove anything, in case the package set
@@ -207,7 +207,7 @@ check_existing_cycle() {
     # directory has been empty for a while.
     if [ -n "$(find "$CYCLE_DIR" -maxdepth 0 -mmin +10 2>/dev/null)" ]; then
       log "FAILED: $CYCLE_DIR exists with no cycle record"
-      notify failure "Cycle lock $CYCLE_DIR exists with no record in it. Check that no cycle is running, then run 'cluster-update-cycle.sh clear'."
+      notify failure "Cycle lock $CYCLE_DIR exists with no record in it. Check that no cycle is running, then run 'cluster-update-cycle.sh clear'." blocked
       exit 1
     fi
     log "Another node is claiming the cycle; exiting"
@@ -220,7 +220,7 @@ check_existing_cycle() {
         log "Node $owner is running cycle $cycle; exiting"
         if ! node_online "$owner" && [ -n "$(find "$RECORD" -mmin +360 2>/dev/null)" ]; then
           CYCLE_ID="$cycle"
-          notify failure "Node $owner holds the cycle record for cycle $cycle but has been offline. Check the cluster, then run 'cluster-update-cycle.sh clear --force'."
+          notify failure "Node $owner holds the cycle record for cycle $cycle but has been offline. Check the cluster, then run 'cluster-update-cycle.sh clear --force'." blocked
           exit 1
         fi
         exit 0
@@ -239,13 +239,13 @@ check_existing_cycle() {
       # Remind from the node that drove it, or from anyone if that node is gone.
       if [ "$owner" = "$SELF_NODE" ] || ! node_online "$owner"; then
         CYCLE_ID="$cycle"
-        notify failure "Not starting: cycle $cycle (driven by $owner) failed and is waiting for manual attention: $reason Run 'cluster-update-cycle.sh clear' once it is sorted out."
+        notify failure "Not starting: cycle $cycle (driven by $owner) failed and is waiting for manual attention: $reason Run 'cluster-update-cycle.sh clear' once it is sorted out." blocked
       fi
       exit 1
       ;;
     *)
       log "FAILED: unknown cycle record status '$status' in $RECORD"
-      notify failure "Cycle record $RECORD has unknown status '$status'. Run 'cluster-update-cycle.sh clear' once checked."
+      notify failure "Cycle record $RECORD has unknown status '$status'. Run 'cluster-update-cycle.sh clear' once checked." blocked
       exit 1
       ;;
   esac
@@ -435,15 +435,48 @@ unpark_guests() {
 
 # ---------- notifications / end states ----------
 
+# notify <info|success|failure> <message> [event]
+# Sends the webhook (if configured) and records a task in the PVE task list, both
+# best effort. <event> is one of start, reboot, result (the default) or blocked.
 notify() {
-  local status="$1" message="$2" payload
-  [ -n "$WEBHOOK_URL" ] || return 0
+  local status="$1" message="$2" event="${3:-result}" payload
   [ "$status" = failure ] && [ "${PARKED:-0}" = 1 ] && message="$message Parked guests may still be stopped: ${PARK_SIDS[*]}."
-  payload=$(jq -n --arg status "$status" --arg message "$message" \
-    --arg cycle "${CYCLE_ID:-none}" --arg node "$SELF_NODE" --arg time "$(date -Is)" \
-    '{status:$status, message:$message, cycle_id:$cycle, node:$node, time:$time}')
-  curl -fsS -m 15 -X POST -H "Content-Type: application/json" -d "$payload" "$WEBHOOK_URL" >/dev/null 2>&1 \
-    || log "WARN: webhook notification failed to send (status=$status)"
+  if [ -n "$WEBHOOK_URL" ]; then
+    payload=$(jq -n --arg status "$status" --arg event "$event" --arg message "$message" \
+      --arg cycle "${CYCLE_ID:-none}" --arg node "$SELF_NODE" --arg time "$(date -Is)" \
+      '{status:$status, event:$event, message:$message, cycle_id:$cycle, node:$node, time:$time}')
+    curl -fsS -m 15 -X POST -H "Content-Type: application/json" -d "$payload" "$WEBHOOK_URL" >/dev/null 2>&1 \
+      || log "WARN: webhook notification failed to send (status=$status)"
+  fi
+  record_task "$status" "$event" "$message"
+}
+
+# This cycle's lines from the log, from its "Starting update cycle" line onward (at
+# most 500), or the last 50 lines if that isn't in the log.
+cycle_log_excerpt() {
+  echo "Full log: $LOG_FILE on $SELF_NODE, also in Node > System > Syslog (tag cluster-update-cycle)."
+  echo
+  sleep 1   # output reaches the file through tee; let the latest lines land
+  awk -v m="Starting update cycle ${CYCLE_ID:-none} " '
+    index($0, m) { n = 0; found = 1 }
+    { buf[n++] = $0 }
+    END { s = n - (found ? 500 : 50); if (s < 0) s = 0; for (i = s; i < n; i++) print buf[i] }
+  ' "$LOG_FILE" 2>/dev/null
+}
+
+# Record a short task (type cluster-update-<event>) in the PVE task list via the
+# helper, if it is installed. A failure here is only logged.
+record_task() {
+  local status="$1" event="$2" message="$3" helper excerpt="" rc
+  helper=$(command -v cluster-update-cycle-task) || return 0
+  if [ "$event" = result ]; then
+    excerpt=$(mktemp) && cycle_log_excerpt > "$excerpt"
+  fi
+  "$helper" "$([ "$status" = failure ] && echo error || echo ok)" "$event" "${CYCLE_ID:-none}" \
+    "$message" ${excerpt:+"$excerpt"} >/dev/null 2>&1
+  rc=$?
+  [ -n "$excerpt" ] && rm -f "$excerpt"
+  [ "$rc" = 0 ] || log "WARN: could not record a task in the PVE task list (helper rc=$rc)"
 }
 
 # Failure after the cycle may have changed something: mark the cluster record failed
@@ -571,7 +604,7 @@ advance() {
     if [ "$node" = "$SELF_NODE" ]; then
       log "Rebooting self ($SELF_NODE); will resume via @reboot"
       PHASE="rebooting_self"; save_state
-      notify info "Rebooting $SELF_NODE (the node running the update cycle); it will resume afterwards."
+      notify info "Rebooting $SELF_NODE (the node running the update cycle); it will resume afterwards." reboot
       sync
       reboot || abort_node "$node" "The reboot command failed on $SELF_NODE; it was NOT rebooted."
       # A successful reboot stops this script during shutdown. Still being here much
@@ -610,6 +643,7 @@ cmd_start() {
   esac
   PHASE="updating"; save_state
   log "=== Starting update cycle $CYCLE_ID on $SELF_NODE; nodes: $(cluster_nodes | tr '\n' ' ')==="
+  notify info "Starting cluster update cycle $CYCLE_ID on $SELF_NODE (nodes: $(cluster_nodes | tr '\n' ' ' | sed 's/ $//'))." start
 
   # Check every node before upgrading any, so a refusal leaves the cluster unchanged.
   for n in $(cluster_nodes); do
@@ -772,9 +806,21 @@ for tool in jq flock pvecm pvesh ha-manager; do
   command -v "$tool" >/dev/null 2>&1 || { echo "missing required tool: $tool" >&2; exit 2; }
 done
 
+# Send all output (ours, apt's, everything) to the log file and the journal, which
+# is what Node > System > Syslog shows. tee -p keeps writing the file even if the
+# journal side goes away.
+log_to_file_and_journal() {
+  mkdir -p "$STATE_DIR"
+  if command -v systemd-cat >/dev/null 2>&1; then
+    exec > >(tee -p -a "$LOG_FILE" | systemd-cat -t cluster-update-cycle) 2>&1
+  else
+    exec >>"$LOG_FILE" 2>&1
+  fi
+}
+
 case "${1:-}" in
-  start)  mkdir -p "$STATE_DIR"; exec >>"$LOG_FILE" 2>&1; cmd_start ;;
-  resume) mkdir -p "$STATE_DIR"; exec >>"$LOG_FILE" 2>&1; cmd_resume ;;
+  start)  log_to_file_and_journal; cmd_start ;;
+  resume) log_to_file_and_journal; cmd_resume ;;
   clear)  cmd_clear "${2:-}" ;;
   plan)   cmd_plan ;;
   status) cmd_status ;;

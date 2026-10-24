@@ -1,0 +1,49 @@
+#!/usr/bin/perl
+# cluster-update-cycle-task - record one short entry in the Proxmox VE task list.
+#
+# Usage: cluster-update-cycle-task <ok|error> <event> <cycle-id> <message> [file]
+#
+# Creates a task of type "cluster-update-<event>" whose log is <message> followed by
+# the contents of [file]. With "error", the task ends with <message> as its error, so
+# it shows as failed in the GUI.
+#
+# This uses Proxmox's internal Perl API (PVE::RPCEnvironment::fork_worker), which has
+# no compatibility promise. cluster-update-cycle.sh treats it as best effort: if a
+# Proxmox update breaks this helper, the cycle logs a warning and carries on.
+
+use strict;
+use warnings;
+
+use PVE::RPCEnvironment;
+
+my ($status, $event, $id, $message, $file) = @ARGV;
+
+die "usage: $0 <ok|error> <event> <cycle-id> <message> [file]\n"
+    if !defined($message) || $status !~ /^(?:ok|error)$/ || $event !~ /^[a-z]+$/;
+
+# The task ID becomes part of the UPID, which allows no colons or whitespace.
+$id =~ s/[^A-Za-z0-9_.-]/_/g;
+$message =~ s/\s+/ /g;
+
+my $rpcenv = PVE::RPCEnvironment->init('cli');
+$rpcenv->init_request();
+$rpcenv->set_language($ENV{LANG} // 'C');
+$rpcenv->set_user('root@pam');
+
+my $worker = sub {
+    print "$message\n";
+    if (defined($file) && open(my $fh, '<', $file)) {
+        print "\n";
+        print while <$fh>;
+        close($fh);
+    }
+    die "$message\n" if $status eq 'error';
+};
+
+# Waits for the worker when run from the command line. A failed worker (status
+# "error") is the intended outcome, not a helper failure, so don't let it set our
+# exit code.
+eval { $rpcenv->fork_worker("cluster-update-$event", $id, 'root@pam', $worker) };
+my $err = $@;
+exit 0 if !$err || $status eq 'error';
+die $err;
