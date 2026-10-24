@@ -1,0 +1,25 @@
+# /etc/cluster-update-cycle.conf - site settings for cluster-update-cycle.sh
+# Sourced as bash. Keep it root-only (chmod 600): the webhook URL is a secret.
+
+# Notifications are POSTed here as JSON: {status, message, cycle_id, node, time}
+# with status one of info | success | failure. Leave empty to disable.
+WEBHOOK_URL="https://my-webhook-url.example.com"
+
+# Guests that must be running on ANOTHER node (and, for VMs, answering guest-agent
+# pings) before a node is rebooted. They need to be HA-managed so maintenance mode
+# moves them. Example: a router VM.
+CRITICAL_SIDS=(vm:101)
+CRITICAL_AGENT_PING=1       # set 0 if a critical VM has no guest agent
+
+# HA guests shut down for the whole cycle and started again at the end. Use this when
+# the remaining nodes cannot hold everything while one node is down.
+PARK_SIDS=()                # e.g. (vm:100)
+
+# Nodes to manage. Empty = every cluster member.
+NODES=()
+
+# Timeouts in seconds.
+#EVACUATE_TIMEOUT=900       # HA maintenance emptying a node
+#REBOOT_TIMEOUT=900         # node coming back after reboot
+#HEALTH_TIMEOUT=300         # critical guest health check
+#SETTLE_TIMEOUT=900         # HA finishing migrations after a node rejoins
