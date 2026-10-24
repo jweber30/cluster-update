@@ -16,8 +16,7 @@ the script goes last and resumes after its own reboot via an `@reboot` cron entr
 
 ## Requirements
 
-- Proxmox VE cluster (tested on a cluster; a single standalone node has no HA/quorum
-  concerns the script cares about, but it should still run)
+- Proxmox VE cluster (tested on a cluster; a single standalone node has no HA/quorum, so the quorum_allows_reboot() check will fail)
 - `jq`, `flock`, `pvecm`, `pvesh`, `ha-manager` on every node that may run the script.
   All but `jq` come with PVE; `jq` isn't always installed (`apt install jq`).
 - Optional: `needrestart` for more precise reboot detection. Without it, the script

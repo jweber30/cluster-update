@@ -501,7 +501,7 @@ fail_clean() {
   log "FAILED (nothing changed): $*"
   PHASE=failed; save_state
   release_cycle
-  notify failure "$* Nothing was changed; the next scheduled run will try again."
+  notify failure "$* The cycle stopped before reboot orchestration. The next scheduled run may retry."
   exit 1
 }
 
