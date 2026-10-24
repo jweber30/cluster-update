@@ -210,7 +210,7 @@ How failures are handled:
   to run, and the driving node re-sends the failure notification on each scheduled
   run (any node does, if the driving node is offline). Fix what's wrong, then run
   `clear`. It lists nodes still in HA maintenance and parked guests that aren't
-  running, but does not change them.
+  running, but does not change them. Note 'clear' cannot fix your cluster for you.
 - **Interrupted cycle** (crash, kill, power loss): the next `start` on the driving
   node marks it `failed`, as above. If the driving node is offline for more than 6
   hours while the record says `running`, the other nodes start sending notifications;
