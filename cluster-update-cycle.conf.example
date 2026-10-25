@@ -23,3 +23,6 @@ NODES=()
 #REBOOT_TIMEOUT=900         # node coming back after reboot
 #HEALTH_TIMEOUT=300         # critical guest health check
 #SETTLE_TIMEOUT=900         # HA finishing migrations after a node rejoins
+# The two above count only time with no migration running; these bound the rest.
+#MIGRATE_MAX_WAIT=21600     # cap on one wait while migrations keep running
+#MIGRATE_ATTEMPTS=2         # failed migration tasks of one guest before stopping

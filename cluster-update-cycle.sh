@@ -29,6 +29,8 @@ EVACUATE_TIMEOUT=900
 REBOOT_TIMEOUT=900
 HEALTH_TIMEOUT=300
 SETTLE_TIMEOUT=900
+MIGRATE_MAX_WAIT=21600    # cap on one evacuation/settle wait while migrations keep running
+MIGRATE_ATTEMPTS=2        # failed migration tasks of one guest before giving up
 
 # shellcheck source=/dev/null
 [ -r "$CONF_FILE" ] && . "$CONF_FILE"
@@ -271,6 +273,69 @@ ha_services_in_transition() {
     | select(.value.state | IN("started","stopped","disabled") | not)
     | "\(.key)=\(.value.state)"' "$HA_MANAGER_STATUS" 2>/dev/null
 }
+ha_sids_in_transition() { local l; l=$(ha_services_in_transition) || return 1; [ -z "$l" ] || sed 's/=.*//' <<<"$l"; }
+
+# Migration tasks (qmigrate/vzmigrate) for the given sids from the cluster-wide task
+# list, one "<vmid> <running|ok|error> <status> <starttime>" line each: every running one, plus
+# finished ones that started at or after <epoch>. Fails if the list cannot be read.
+migration_tasks_since() {
+  local since="$1" ids json; shift
+  ids=$(for s in "$@"; do sid_vmid "$s"; done | jq -R . | jq -sc .)
+  json=$(pvesh get /cluster/tasks --output-format json 2>/dev/null) || return 1
+  jq -r --argjson ids "$ids" --argjson since "$since" '.[]
+    | select(.type == "qmigrate" or .type == "vzmigrate")
+    | select(.id as $i | $ids | index($i))
+    | select(.endtime == null or (.starttime // 0) >= $since)
+    | (.status // "") as $st
+    | "\(.id)\t\(if .endtime == null then "running"
+                 elif ($st == "OK" or ($st | startswith("WARNINGS"))) then "ok"
+                 else "error" end)\t\($st)\t\(.starttime // 0)"' <<<"$json"
+}
+
+# wait_for_ha_moves <idle-timeout> <list-command...>: wait until the list command
+# (which prints HA sids still to move) prints nothing. A large guest can take hours to
+# migrate, so time spent while one of those guests has a migration task running does
+# not count toward <idle-timeout>; MIGRATE_MAX_WAIT caps the whole wait. HA retries a
+# failed migration on its own; after MIGRATE_ATTEMPTS failures of one guest, or a guest
+# in HA error state, this gives up. Sets REASON.
+wait_for_ha_moves() {
+  local idle_limit="$1" since idle=0 total=0 left tasks running failed sid st id msg key seen="" next_note=600
+  shift
+  since=$(date +%s)
+  while true; do
+    # A failed read of the HA status must not look like "nothing left".
+    left=$("$@") || left="(HA status unreadable)"
+    left=${left//$'\n'/ }
+    [ -z "$left" ] && return 0
+    for sid in $left; do
+      st=$(ha_service_field "$sid" state)
+      [ "$st" = error ] && { REASON="$sid is in HA error state"; log "ERROR: $REASON"; return 1; }
+    done
+    running=""; failed=""
+    if [ "$left" != "(HA status unreadable)" ] && tasks=$(migration_tasks_since "$since" $left); then
+      running=$(awk -F'\t' '$2=="running"{print $1}' <<<"$tasks" | sort -u | tr '\n' ' ')
+      failed=$(awk -F'\t' -v max="$MIGRATE_ATTEMPTS" '$2=="error"{n[$1]++; s[$1]=$3}
+        END{for (i in n) if (n[i] >= max) printf "%s (%d failed: %s) ", i, n[i], s[i]}' <<<"$tasks")
+      while IFS=$'\t' read -r id st msg key; do
+        [ "$st" = error ] || continue
+        key="$id@$key"
+        in_list "$key" "$seen" && continue
+        seen="$seen $key"
+        log "WARN: migration of guest $id failed: $msg"
+      done <<<"$tasks"
+    fi
+    [ -n "$failed" ] && { REASON="migration failed after $MIGRATE_ATTEMPTS attempts: ${failed% }"; log "ERROR: $REASON"; return 1; }
+    sleep 5; total=$((total+5))
+    if [ -n "$running" ]; then
+      idle=0
+      [ "$total" -ge "$next_note" ] && { log "Still migrating guest(s) ${running% } (${total}s so far)"; next_note=$((total+600)); }
+    else
+      idle=$((idle+5))
+    fi
+    [ "$idle" -ge "$idle_limit" ] && { REASON="no migration progress for ${idle_limit}s; waiting on: $left"; log "ERROR: $REASON"; return 1; }
+    [ "$total" -ge "$MIGRATE_MAX_WAIT" ] && { REASON="still waiting after ${MIGRATE_MAX_WAIT}s: $left"; log "ERROR: $REASON"; return 1; }
+  done
+}
 
 wait_for_ha_node_state() {
   local node="$1" want="$2" timeout="${3:-300}" waited=0
@@ -285,18 +350,14 @@ wait_for_ha_node_state() {
 # evacuated for a reboot are moved back once the node returns; the next step must not
 # start while that is still in flight.
 wait_for_ha_settled() {
-  local waited=0 busy n
+  local busy n
   ha_in_use || return 0
   for n in $(cluster_nodes); do wait_for_ha_node_state "$n" online || return 1; done
   sleep 30
-  while true; do
-    # A failed read of the HA status must not look like "nothing in transition".
-    busy=$(ha_services_in_transition) || busy="(HA status unreadable)"
-    busy=${busy//$'\n'/ }
-    [ -z "$busy" ] && return 0
-    sleep 5; waited=$((waited+5))
-    [ "$waited" -ge "$SETTLE_TIMEOUT" ] && { log "ERROR: HA services still in transition after ${SETTLE_TIMEOUT}s: $busy"; return 1; }
-  done
+  wait_for_ha_moves "$SETTLE_TIMEOUT" ha_sids_in_transition && return 0
+  busy=$(ha_services_in_transition) || busy="(HA status unreadable)"
+  log "ERROR: HA services still in transition: ${busy//$'\n'/ }"
+  return 1
 }
 
 # retry <timeout> <command...>: run the command every 5s until it succeeds or the
@@ -357,19 +418,13 @@ upgrade_progress() {
 }
 
 evacuate_node() {
-  local node="$1" waited=0 left
+  local node="$1"
   ha_in_use || return 0
   log "Enabling HA maintenance on $node"
   ha_maintenance "$node" enable || return 1
   wait_for_ha_node_state "$node" maintenance 180 || return 1
-  while true; do
-    # A failed read of the HA status must not look like an empty node.
-    left=$(ha_services_on "$node") || left="(HA status unreadable)"
-    left=${left//$'\n'/ }
-    [ -z "$left" ] && { log "$node holds no active HA services"; return 0; }
-    sleep 5; waited=$((waited+5))
-    [ "$waited" -ge "$EVACUATE_TIMEOUT" ] && { log "ERROR: HA services still on $node after ${EVACUATE_TIMEOUT}s: $left"; REASON="still on $node: $left"; return 1; }
-  done
+  wait_for_ha_moves "$EVACUATE_TIMEOUT" ha_services_on "$node" || return 1
+  log "$node holds no active HA services"
 }
 
 # ---------- guests ----------

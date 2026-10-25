@@ -119,6 +119,12 @@ to `/etc/cluster-update-cycle.conf` (override the path with
   remaining nodes) and started again at the end.
 - `NODES` — nodes to manage. Empty means every cluster member.
 - `EVACUATE_TIMEOUT`, `REBOOT_TIMEOUT`, `HEALTH_TIMEOUT`, `SETTLE_TIMEOUT` — seconds.
+  `EVACUATE_TIMEOUT` and `SETTLE_TIMEOUT` count only time with no migration task
+  running for the guests still waiting to move, so a large VM can take as long as it
+  needs, up to `MIGRATE_MAX_WAIT` (default 21600, i.e. 6 hours).
+- `MIGRATE_ATTEMPTS` — HA retries a failed migration by itself; after this many
+  failed migration tasks for one guest (default 2) the cycle stops. Each failure is
+  logged with the task's error. A guest in HA `error` state stops it at once.
 
 ## What it doesn't do
 
