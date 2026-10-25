@@ -1,7 +1,6 @@
 # cluster-update-cycle
 
-> **Work in progress.** This is a concept I run on my own three-node homelab
-> cluster. It hasn't been tested widely, so read it before you trust it with yours.
+> **Work in progress.** This is a concept in progress. It hasn't been tested widely, so read it before you trust it with yours.
 > Feedback, issues and suggestions are welcome.
 
 Built with Claude Sonnet 5 and Opus 5.5.
@@ -31,9 +30,9 @@ the script goes last and resumes after its own reboot via an `@reboot` cron entr
 cp cluster-update-cycle.sh cluster-update-cycle-task /usr/local/sbin/
 chmod 750 /usr/local/sbin/cluster-update-cycle.sh /usr/local/sbin/cluster-update-cycle-task
 
-cp cluster-update-cycle.conf.example /etc/cluster-update-cycle.conf
-chmod 600 /etc/cluster-update-cycle.conf
-# edit /etc/cluster-update-cycle.conf for your site
+# once, on any node: the config is shared through the cluster filesystem
+cp cluster-update-cycle.conf.example /etc/pve/priv/cluster-update-cycle.conf
+# edit /etc/pve/priv/cluster-update-cycle.conf for your site
 ```
 
 ### Cron
@@ -106,8 +105,14 @@ critical guest that isn't actually HA-managed.
 ## Configuration
 
 See [cluster-update-cycle.conf.example](cluster-update-cycle.conf.example), installed
-to `/etc/cluster-update-cycle.conf` (override the path with
-`CLUSTER_UPDATE_CYCLE_CONF`). Keep it `chmod 600` — the webhook URL is a secret.
+to `/etc/pve/priv/cluster-update-cycle.conf`, so every node reads the same file.
+`/etc/pve/priv` is root-only, which matters because the webhook URL is a secret. If
+that file doesn't exist, the script falls back to `/etc/cluster-update-cycle.conf` on
+the node (keep that one `chmod 600`). `CLUSTER_UPDATE_CYCLE_CONF` overrides both.
+
+`start` and `resume` never run without a config: they wait up to 5 minutes for one
+(the cluster filesystem may still be starting after a boot), then stop and record a
+`cluster-update-config` failure in the PVE task list. `plan` says when none is found.
 
 - `WEBHOOK_URL` — JSON notifications; see below. Empty disables them.
 - `CRITICAL_SIDS` — HA guests (e.g. `vm:104`) that must be confirmed running on
@@ -122,6 +127,11 @@ to `/etc/cluster-update-cycle.conf` (override the path with
   `EVACUATE_TIMEOUT` and `SETTLE_TIMEOUT` count only time with no migration task
   running for the guests still waiting to move, so a large VM can take as long as it
   needs, up to `MIGRATE_MAX_WAIT` (default 21600, i.e. 6 hours).
+- `MIN_ROOT_FREE_MB` — free space on `/` each other node needs before a node is
+  evacuated (default 2048).
+- `MIN_FREE_MEM_MB` — memory each node must still have free after taking the guests
+  of a node being evacuated (default 1024).
+- `RELOCATE_SIDS` — HA VMs moved by shutdown and start instead of live migration.
 - `MIGRATE_ATTEMPTS` — HA retries a failed migration by itself; after this many
   failed migration tasks for one guest (default 2) the cycle stops. Each failure is
   logged with the task's error. A guest in HA `error` state stops it at once.
@@ -260,6 +270,28 @@ and starts any parked guests again at its end.
   A failure stops the cycle (sticky, like other failures after a change), and the
   notification lists which nodes were and weren't upgraded. The check adds roughly
   30–60 seconds per node.
+- Before a node enters HA maintenance, the other nodes must be able to take its
+  guests (retried for up to 2 minutes, then the cycle stops with that node untouched):
+  - every other node is in the cluster with `corosync`, `pve-cluster`, `pvedaemon`
+    and `pvestatd` active (plus `pve-ha-lrm`/`pve-ha-crm` with HA), and at least
+    `MIN_ROOT_FREE_MB` (default 2048) free on `/`;
+  - HA reports each of them `online`, and its HA agent (LRM) is active or idle and
+    reported in the last 2 minutes;
+  - the running HA guests on the node fit on the other nodes *together*: memory
+    (configured size, ignoring ballooning, keeping `MIN_FREE_MEM_MB` free on each
+    target) and local disks (configured sizes, so thin disks count in full; nothing is
+    needed on a node that already holds a replica from a replication job). Strict
+    node-affinity rules, positive and negative, limit where each guest may go. The
+    check finds one placement that fits; HA still makes its own choice when it
+    evacuates, except for `RELOCATE_SIDS` guests, which the script places itself.
+
+  `plan` shows the result of this check for each node, with the placement it found.
+- Guests in `RELOCATE_SIDS` are moved before maintenance with HA's `relocate` (shut
+  down, move, start) instead of being live-migrated. Use it for VMs that must not be
+  live-migrated, for example between Intel and AMD nodes. Set `failback 0` on them
+  (`ha-manager set vm:215 --failback 0`): otherwise HA live-migrates them back to a
+  higher-priority node as soon as it can. With failback off they stay where they were
+  moved after the cycle.
 - Reboot detection has three outcomes: needed, not needed, and couldn't tell (which
   stops the cycle). It uses `needrestart` when that gives a usable answer, and
   otherwise compares the running kernel with the newest one in `/boot`. If you pin

@@ -1,5 +1,6 @@
-# /etc/cluster-update-cycle.conf - site settings for cluster-update-cycle.sh
-# Sourced as bash. Keep it root-only (chmod 600): the webhook URL is a secret.
+# /etc/pve/priv/cluster-update-cycle.conf - site settings for cluster-update-cycle.sh,
+# shared by every node. Sourced as bash. /etc/pve/priv is root-only, which keeps the
+# webhook URL secret. (Fallback: /etc/cluster-update-cycle.conf, chmod 600.)
 
 # Notifications are POSTed here as JSON: {status, message, cycle_id, node, time}
 # with status one of info | success | failure. Leave empty to disable.
@@ -15,6 +16,11 @@ CRITICAL_AGENT_PING=1       # set 0 if a critical VM has no guest agent
 # the remaining nodes cannot hold everything while one node is down.
 PARK_SIDS=()                # e.g. (vm:100)
 
+# HA VMs moved before maintenance by shutdown + start (ha-manager relocate) instead of
+# live migration, e.g. VMs that crash when live-migrated between Intel and AMD nodes.
+# Set failback 0 on them, or HA live-migrates them back to a higher-priority node.
+RELOCATE_SIDS=()            # e.g. (vm:215)
+
 # Nodes to manage. Empty = every cluster member.
 NODES=()
 
@@ -26,3 +32,5 @@ NODES=()
 # The two above count only time with no migration running; these bound the rest.
 #MIGRATE_MAX_WAIT=21600     # cap on one wait while migrations keep running
 #MIGRATE_ATTEMPTS=2         # failed migration tasks of one guest before stopping
+#MIN_ROOT_FREE_MB=2048      # free space on / of each other node before evacuating one
+#MIN_FREE_MEM_MB=1024       # memory each target keeps free after taking evacuated guests

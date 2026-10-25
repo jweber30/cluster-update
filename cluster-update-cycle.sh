@@ -11,13 +11,25 @@
 # and ask for help. A cycle that fails after changing something blocks later cycles on
 # every node until someone runs `clear`.
 #
-# Site settings live in /etc/cluster-update-cycle.conf; see the example file.
+# Site settings live in /etc/pve/priv/cluster-update-cycle.conf (shared by all nodes); see
+# the example file.
 
 set -uo pipefail
 # cron's default PATH lacks /usr/sbin, where ha-manager, qm, reboot and needrestart live.
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
-CONF_FILE="${CLUSTER_UPDATE_CYCLE_CONF:-/etc/cluster-update-cycle.conf}"
+# The config lives on the cluster filesystem so every node reads the same one; a
+# per-node file in /etc is the fallback. CLUSTER_UPDATE_CYCLE_CONF overrides both.
+SHARED_CONF="/etc/pve/priv/cluster-update-cycle.conf"
+LOCAL_CONF="/etc/cluster-update-cycle.conf"
+find_conf() {
+  if [ -n "${CLUSTER_UPDATE_CYCLE_CONF:-}" ]; then echo "$CLUSTER_UPDATE_CYCLE_CONF"
+  elif [ -r "$SHARED_CONF" ]; then echo "$SHARED_CONF"
+  elif [ -r "$LOCAL_CONF" ]; then echo "$LOCAL_CONF"
+  else echo "$SHARED_CONF"
+  fi
+}
+CONF_FILE=$(find_conf)
 
 # Defaults, overridable from the config file.
 WEBHOOK_URL=""            # JSON POST target for notifications; empty disables them
@@ -31,9 +43,13 @@ HEALTH_TIMEOUT=300
 SETTLE_TIMEOUT=900
 MIGRATE_MAX_WAIT=21600    # cap on one evacuation/settle wait while migrations keep running
 MIGRATE_ATTEMPTS=2        # failed migration tasks of one guest before giving up
+MIN_ROOT_FREE_MB=2048     # free space on / every other node needs before a node is evacuated
+MIN_FREE_MEM_MB=1024      # memory each target node keeps free after taking evacuated guests
+RELOCATE_SIDS=()          # HA VMs moved by shutdown+start (relocate) instead of live migration
 
 # shellcheck source=/dev/null
-[ -r "$CONF_FILE" ] && . "$CONF_FILE"
+load_conf() { CONF_FILE=$(find_conf); [ -r "$CONF_FILE" ] || return 1; . "$CONF_FILE"; }
+load_conf
 
 STATE_DIR="/var/lib/cluster-update-cycle"
 STATE_FILE="$STATE_DIR/state"
@@ -48,6 +64,7 @@ MEMBERS="/etc/pve/.members"
 PVE_NODES_DIR="/etc/pve/nodes"
 HA_MANAGER_STATUS="/etc/pve/ha/manager_status"
 HA_RESOURCES="/etc/pve/ha/resources.cfg"
+HA_RULES="/etc/pve/ha/rules.cfg"
 
 STATE_VARS="PHASE CYCLE_ID PENDING DONE CURRENT PARKED"
 
@@ -393,6 +410,233 @@ lrm_reported_since() {
   return 1
 }
 
+# ---------- can the other nodes take guests? ----------
+
+# Bytes for a PVE size string such as 8G, 512M, 1.5T or a plain byte count.
+size_bytes() {
+  awk -v s="$1" 'BEGIN { m = 1; u = toupper(substr(s, length(s)))
+    if (u == "K") m = 1024; else if (u == "M") m = 1024^2; else if (u == "G") m = 1024^3; else if (u == "T") m = 1024^4
+    if (m > 1) s = substr(s, 1, length(s) - 1)
+    printf "%.0f\n", s * m }'
+}
+gib() { awk -v b="$1" 'BEGIN { printf "%.1f GiB", b / 1024^3 }'; }
+
+guest_conf() {
+  case "${1%%:*}" in
+    vm) echo "$PVE_NODES_DIR/$2/qemu-server/$(sid_vmid "$1").conf" ;;
+    ct) echo "$PVE_NODES_DIR/$2/lxc/$(sid_vmid "$1").conf" ;;
+  esac
+}
+
+# Configured memory of <sid> on <node> in MB (PVE's default is 512). Ballooning is
+# ignored: a guest may grow to its full size at any time.
+guest_memory_mb() {
+  local conf; conf=$(guest_conf "$1" "$2")
+  [ -r "$conf" ] || { echo 0; return; }
+  sed '/^\[/,$d' "$conf" | awk -F': ' '$1 == "memory" { m = $2 } END { print (m == "" ? 512 : m + 0) }'
+}
+
+# "<storage> <replicable-bytes> <other-bytes>" per non-shared storage that <sid>'s disks
+# on <node> use. Sizes are the configured (provisioned) ones: thin volumes can need
+# less, but a migration that runs out of room part-way is far worse than a cautious
+# refusal. Volumes marked replicate=0 never have a replica on another node.
+guest_local_disks() {
+  local sid="$1" node="$2" conf shared
+  conf=$(guest_conf "$sid" "$node")
+  [ -n "$conf" ] && [ -r "$conf" ] || return 0
+  shared=$(pvesh get "/nodes/$node/storage" --output-format json 2>/dev/null \
+    | jq -r '.[] | select(.shared == 1) | .storage') || return 1
+  awk -F': ' -v shared=" $(echo $shared) " '
+    /^\[/ { exit }   # snapshot sections follow the current config
+    $1 ~ /^(rootfs|mp[0-9]+|(scsi|virtio|sata|ide)[0-9]+|efidisk0|tpmstate0)$/ {
+      v = $2
+      if (v ~ /media=cdrom/ || v !~ /^[^,\/]+:/) next
+      st = v; sub(/:.*/, "", st)
+      if (st == "none" || index(shared, " " st " ")) next
+      size = ""; n = split(v, f, ",")
+      for (i = 2; i <= n; i++) if (f[i] ~ /^size=/) size = substr(f[i], 6)
+      if (size == "") next
+      if (v ~ /replicate=0/) other[st] = other[st] " " size; else rep[st] = rep[st] " " size
+      seen[st] = 1
+    }
+    END { for (st in seen) print st "|" rep[st] "|" other[st] }' "$conf" |
+  while IFS='|' read -r st reps others; do
+    local r=0 o=0 s
+    for s in $reps; do r=$(( r + $(size_bytes "$s") )); done
+    for s in $others; do o=$(( o + $(size_bytes "$s") )); done
+    echo "$st $r $o"
+  done
+}
+
+# Nodes that hold a replica of <sid>'s disks from <node> (enabled replication jobs).
+replication_targets() {
+  pvesh get /cluster/replication --output-format json 2>/dev/null | jq -r \
+    --arg id "$(sid_vmid "$1")" --arg src "$2" \
+    '.[] | select((.guest | tostring) == $id and .source == $src and (.disable // 0) != 1) | .target'
+}
+
+# Strict, enabled node-affinity rules for <sid>: "+node" for each node a positive rule
+# allows, "-node" for each node a negative rule forbids.
+strict_rule_nodes() {
+  [ -r "$HA_RULES" ] || return 0
+  awk -v sid="$1" '
+    function flush(   n, a, i) {
+      if (type == "node-affinity" && strict == 1 && !dis && index(res, "," sid ",")) {
+        n = split(nodes, a, ",")
+        for (i = 1; i <= n; i++) { sub(/:.*/, "", a[i]); print (neg ? "-" : "+") a[i] } }
+    }
+    /^[a-z-]+: / { flush(); type = $1; sub(/:$/, "", type); res = ""; nodes = ""; strict = 0; dis = 0; neg = 0; next }
+    $1 == "resources" { res = "," $2 "," }
+    $1 == "nodes" { nodes = $2 }
+    $1 == "strict" { strict = $2 }
+    $1 == "affinity" { neg = ($2 == "negative") }
+    $1 == "disable" { dis = ($2 == "" || $2 != 0) }
+    END { flush() }' "$HA_RULES" | sort -u
+}
+
+# Nodes HA may move <sid> to when <from> is evacuated.
+guest_targets() {
+  local sid="$1" from="$2" rules allow n
+  rules=$(strict_rule_nodes "$sid")
+  allow=$(sed -n 's/^+//p' <<<"$rules")
+  for n in $(jq -r '.nodelist | keys[]' "$MEMBERS"); do
+    [ "$n" = "$from" ] && continue
+    [ -z "$allow" ] || grep -qxF "$n" <<<"$allow" || continue
+    grep -qxF -- "-$n" <<<"$rules" && continue
+    echo "$n"
+  done
+}
+
+storage_avail() {
+  pvesh get "/nodes/$1/storage" --output-format json 2>/dev/null \
+    | jq -r --arg s "$2" '.[] | select(.storage == $s and .active == 1) | .avail // 0' | head -n1
+}
+node_mem_available_mb() {
+  pvesh get "/nodes/$1/status" --output-format json 2>/dev/null \
+    | jq -r '(.memory.available // .memory.free // 0) / 1048576 | floor'
+}
+
+# Plan where the running HA guests on <node> go: the guests with the fewest allowed
+# nodes first, then the largest, each to the
+# allowed node with the most memory left that also has room for its local disks (none
+# needed where a replica already exists), counting the guests already planned there.
+# Fills PLACEMENT[sid]=node. HA makes its own choice when evacuating, so this shows
+# that a fitting placement exists, not that HA will pick it; RELOCATE_SIDS guests do
+# follow it. Sets REASON.
+declare -A PLACEMENT=()
+plan_guest_placement() {
+  local node="$1" sids order need sid targets disks reps t best bestfree ok memfit store r o d k summary
+  local -A mem=() disk=()
+  PLACEMENT=()
+  sids=$(ha_services_on "$node") || { REASON="HA status unreadable"; return 1; }
+  order=$(for sid in $sids; do
+      targets=$(guest_targets "$sid" "$node" | tr '\n' ' ')
+      echo "$(wc -w <<<"$targets") $(guest_memory_mb "$sid" "$node") $sid $targets"
+    done | sort -k1,1n -k2,2nr)
+  while read -r _ need sid targets; do
+    [ -n "$sid" ] || continue
+    [ -n "$targets" ] || { REASON="no node other than $node is allowed to run $sid (HA rules)"; return 1; }
+    disks=$(guest_local_disks "$sid" "$node") || { REASON="could not read the storage list of $node"; return 1; }
+    reps=" $(replication_targets "$sid" "$node" | tr '\n' ' ') "
+    best=""; bestfree=-1; memfit=""
+    for t in $targets; do
+      [ -n "${mem[$t]+set}" ] || mem[$t]=$(( $(node_mem_available_mb "$t") - MIN_FREE_MEM_MB ))
+      [ "${mem[$t]}" -ge "$need" ] || continue
+      memfit=1; ok=1
+      while read -r store r o; do
+        [ -n "$store" ] || continue
+        case "$reps" in *" $t "*) d=$o ;; *) d=$(( r + o )) ;; esac
+        k="$t/$store"
+        [ -n "${disk[$k]+set}" ] || disk[$k]=$(storage_avail "$t" "$store")
+        [ "${disk[$k]:-0}" -ge "$d" ] 2>/dev/null || { ok=0; break; }
+      done <<<"$disks"
+      [ "$ok" = 1 ] && [ "${mem[$t]}" -gt "$bestfree" ] && { best=$t; bestfree=${mem[$t]}; }
+    done
+    if [ -z "$best" ]; then
+      summary=""
+      while read -r store r o; do [ -n "$store" ] && summary="$summary, $(gib $(( r + o ))) on $store"; done <<<"$disks"
+      if [ -z "$memfit" ]; then
+        REASON="not enough memory for $sid (${need} MB) on any node it may move to (${targets% }), counting the other guests from $node and keeping $MIN_FREE_MEM_MB MB free"
+      else
+        REASON="not enough disk space for $sid (${summary#, }) on any node it may move to with room for its memory (${targets% }), counting the other guests from $node"
+      fi
+      return 1
+    fi
+    mem[$best]=$(( mem[$best] - need ))
+    while read -r store r o; do
+      [ -n "$store" ] || continue
+      case "$reps" in *" $best "*) d=$o ;; *) d=$(( r + o )) ;; esac
+      disk[$best/$store]=$(( ${disk[$best/$store]:-0} - d ))
+    done <<<"$disks"
+    PLACEMENT[$sid]=$best
+  done <<<"$order"
+  return 0
+}
+
+# Before <node> enters maintenance: every other node is in the cluster, has its PVE
+# services running and room on /, has an HA agent that is online and reporting, and
+# the HA guests on <node> fit on the other nodes together (plan_guest_placement).
+# Sets REASON.
+others_ready_for_guests() {
+  local node="$1" n free_mb st mode state ts now
+  local units="corosync pve-cluster pvedaemon pvestatd"
+  ha_in_use && units="$units pve-ha-lrm pve-ha-crm"
+  now=$(date +%s)
+  for n in $(cluster_nodes); do
+    [ "$n" = "$node" ] && continue
+    node_online "$n" || { REASON="node $n is offline"; return 1; }
+    units_active "$n" $units || return 1
+    free_mb=$(run_on "$n" "df -Pm / | awk 'NR == 2 { print \$4 }'") \
+      || { REASON="could not reach $n to check its disk space"; return 1; }
+    [ "${free_mb:-0}" -ge "$MIN_ROOT_FREE_MB" ] 2>/dev/null \
+      || { REASON="only ${free_mb:-?} MB free on / of $n (need $MIN_ROOT_FREE_MB)"; return 1; }
+    ha_in_use || continue
+    st=$(ha_node_state "$n")
+    [ "$st" = online ] || { REASON="HA reports $n as '${st:-unknown}'"; return 1; }
+    read -r mode state ts < <(jq -r '"\(.mode // "-") \(.state // "-") \(.timestamp // 0)"' \
+      "$PVE_NODES_DIR/$n/lrm_status" 2>/dev/null)
+    ts=${ts%.*}
+    [ "$mode" = active ] || { REASON="HA agent (LRM) on $n is in mode '${mode:-unknown}'"; return 1; }
+    case "$state" in
+      active|wait_for_agent_lock) ;;  # the latter is an idle agent, ready for services
+      *) REASON="HA agent (LRM) on $n is in state '${state:-unknown}'"; return 1 ;;
+    esac
+    [ $(( now - ${ts:-0} )) -le 120 ] 2>/dev/null \
+      || { REASON="HA agent (LRM) on $n last reported $(( now - ${ts:-0} ))s ago"; return 1; }
+  done
+  ha_in_use || return 0
+  plan_guest_placement "$node"
+}
+
+# failback is off for <sid> in resources.cfg (it defaults to on).
+failback_off() {
+  awk -v sid="$1" '/^[a-z]+: / { cur = $1 $2; next } cur == sid && $1 == "failback" { v = $2 }
+    END { exit !(v == "0") }' "$HA_RESOURCES" 2>/dev/null
+}
+sid_not_started_on() {
+  [ "$(ha_service_field "$1" node)" = "$2" ] && [ "$(ha_service_field "$1" state)" = started ] || echo "$1"
+}
+
+# Move the RELOCATE_SIDS guests on <node> to their planned node with HA's relocate
+# (shut down, move, start) before maintenance would live-migrate them. Needs a fresh
+# PLACEMENT for <node>. Sets REASON.
+relocate_guests() {
+  local node="$1" sid t
+  for sid in "${RELOCATE_SIDS[@]}"; do
+    [ "$(ha_service_field "$sid" node)" = "$node" ] || continue
+    [ "$(ha_service_field "$sid" state)" = started ] || continue
+    t=${PLACEMENT[$sid]:-}
+    [ -n "$t" ] || { REASON="no target planned for $sid"; return 1; }
+    failback_off "$sid" || log "WARN: $sid has failback on; HA may live-migrate it back to a higher-priority node"
+    log "Relocating $sid from $node to $t (shut down, move, start)"
+    ha-manager crm-command relocate "$sid" "$t" || { REASON="relocate request for $sid failed"; return 1; }
+    wait_for_ha_moves "$EVACUATE_TIMEOUT" sid_not_started_on "$sid" "$t" || return 1
+    wait_guest_status "$sid" running "$HEALTH_TIMEOUT" || { REASON="$sid not running after its relocation to $t"; return 1; }
+    log "$sid running on $t"
+  done
+  return 0
+}
+
 # Health of <node> right after its packages were upgraded at <epoch>. Package
 # scripts restart these daemons, so a broken update shows up here. Sets REASON.
 check_node_after_upgrade() {
@@ -656,6 +900,8 @@ advance() {
     in_list "$node" "$DONE" && continue
     assert_owner "evacuating $node"
     quorum_allows_reboot || fail "Not safe to reboot $node: $REASON. Cycle halted."
+    retry 120 others_ready_for_guests "$node" || fail "Not safe to evacuate $node: $REASON. Cycle halted; $node was NOT put into maintenance."
+    relocate_guests "$node" || fail "Could not relocate guests off $node ($REASON). Cycle halted; $node was NOT put into maintenance."
     CURRENT="$node"; PHASE="evacuating"; save_state
     evacuate_node "$node" || abort_node "$node" "Could not evacuate $node (${REASON:-HA maintenance failed}); it was NOT rebooted."
     check_critical "$node" || abort_node "$node" "Critical guest not healthy away from $node ($REASON); $node was NOT rebooted."
@@ -825,7 +1071,7 @@ cmd_clear() {
 # Read-only: what a cycle started now would do.
 cmd_plan() {
   local n sid rc line
-  echo "self: $SELF_NODE    config: $CONF_FILE$([ -r "$CONF_FILE" ] || echo ' (not found, using defaults)')"
+  echo "self: $SELF_NODE    config: $CONF_FILE$([ -r "$CONF_FILE" ] || echo ' (NOT FOUND: start/resume would stop; showing defaults)')"
   echo "nodes: $(cluster_nodes | tr '\n' ' ')"
   if quorum_allows_reboot; then echo "quorum: OK to take one node down"; else echo "quorum: NOT safe - $REASON"; fi
   if ha_in_use; then
@@ -839,6 +1085,11 @@ cmd_plan() {
     echo "$line"
   done
   [ "${#PARK_SIDS[@]}" -gt 0 ] && echo "parked during a cycle: ${PARK_SIDS[*]}"
+  for sid in "${RELOCATE_SIDS[@]}"; do
+    line="relocated (shutdown+start) instead of live-migrated: $sid"
+    failback_off "$sid" || line="$line  WARNING: failback is on, so HA may live-migrate it back"
+    echo "$line"
+  done
   for n in $(cluster_nodes | grep -vx "$SELF_NODE") $(cluster_nodes | grep -x "$SELF_NODE"); do
     node_needs_reboot "$n"; rc=$?
     case $rc in
@@ -849,6 +1100,12 @@ cmd_plan() {
     esac
     echo "-- $n: $line; HA state: $(ha_node_state "$n")"
     echo "   HA services to evacuate: $(ha_services_on "$n" | tr '\n' ' ')"
+    if others_ready_for_guests "$n"; then
+      line=""; for sid in "${!PLACEMENT[@]}"; do line="$line $sid->${PLACEMENT[$sid]}"; done
+      echo "   other nodes ready to take its guests; a fitting placement:${line:- (nothing to move)}"
+    else
+      echo "   NOT ready to evacuate: $REASON"
+    fi
   done
 }
 
@@ -877,9 +1134,26 @@ log_to_file_and_journal() {
   fi
 }
 
+# Running with built-in defaults would mean no notifications, no critical guests and
+# no relocations, so a cycle never starts without its config. Right after a boot the
+# cluster filesystem may not be mounted yet, hence the wait.
+require_conf() {
+  local waited=0
+  until [ -r "$CONF_FILE" ]; do
+    if [ "$waited" -ge 300 ]; then
+      log "FAILED (nothing changed): no config file found ($SHARED_CONF, $LOCAL_CONF); not running without one"
+      record_task failure config "No config file found ($SHARED_CONF or $LOCAL_CONF); the cycle did not run."
+      exit 1
+    fi
+    [ "$waited" = 0 ] && log "Waiting for the config file ($SHARED_CONF or $LOCAL_CONF)"
+    sleep 10; waited=$((waited+10))
+    load_conf
+  done
+}
+
 case "${1:-}" in
-  start)  log_to_file_and_journal; cmd_start ;;
-  resume) log_to_file_and_journal; cmd_resume ;;
+  start)  log_to_file_and_journal; require_conf; cmd_start ;;
+  resume) log_to_file_and_journal; require_conf; cmd_resume ;;
   clear)  cmd_clear "${2:-}" ;;
   plan)   cmd_plan ;;
   status) cmd_status ;;
