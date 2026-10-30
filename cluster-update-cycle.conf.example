@@ -14,12 +14,12 @@ CRITICAL_AGENT_PING=1       # set 0 if a critical VM has no guest agent
 
 # HA guests shut down for the whole cycle and started again at the end. Use this when
 # the remaining nodes cannot hold everything while one node is down.
-PARK_SIDS=()                # e.g. (vm:100)
+PARK_SIDS=()
 
 # HA VMs moved before maintenance by shutdown + start (ha-manager relocate) instead of
 # live migration, e.g. VMs that crash when live-migrated between Intel and AMD nodes.
 # Set failback 0 on them, or HA live-migrates them back to a higher-priority node.
-RELOCATE_SIDS=()            # e.g. (vm:215)
+RELOCATE_SIDS=()
 
 # Nodes to manage. Empty = every cluster member.
 NODES=()
