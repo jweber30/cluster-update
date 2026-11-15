@@ -518,14 +518,14 @@ node_mem_available_mb() {
 
 # Plan where the running HA guests on <node> go: the guests with the fewest allowed
 # nodes first, then the largest, each to the
-# allowed node with the most memory left that also has room for its local disks (none
-# needed where a replica already exists), counting the guests already planned there.
+# allowed node that has room for its memory and local disks, preferring a node that
+# already holds a replica (no disk copy needed), then the one with the most memory left, counting the guests already planned there.
 # Fills PLACEMENT[sid]=node. HA makes its own choice when evacuating, so this shows
 # that a fitting placement exists, not that HA will pick it; RELOCATE_SIDS guests do
 # follow it. Sets REASON.
 declare -A PLACEMENT=()
 plan_guest_placement() {
-  local node="$1" sids order need sid targets disks reps t best bestfree ok memfit store r o d k summary
+  local node="$1" sids order need sid targets disks reps t best bestfree bestrep isrep ok memfit store r o d k summary
   local -A mem=() disk=()
   PLACEMENT=()
   sids=$(ha_services_on "$node") || { REASON="HA status unreadable"; return 1; }
@@ -538,7 +538,7 @@ plan_guest_placement() {
     [ -n "$targets" ] || { REASON="no node other than $node is allowed to run $sid (HA rules)"; return 1; }
     disks=$(guest_local_disks "$sid" "$node") || { REASON="could not read the storage list of $node"; return 1; }
     reps=" $(replication_targets "$sid" "$node" | tr '\n' ' ') "
-    best=""; bestfree=-1; memfit=""
+    best=""; bestfree=-1; bestrep=0; memfit=""
     for t in $targets; do
       [ -n "${mem[$t]+set}" ] || mem[$t]=$(( $(node_mem_available_mb "$t") - MIN_FREE_MEM_MB ))
       [ "${mem[$t]}" -ge "$need" ] || continue
@@ -550,7 +550,11 @@ plan_guest_placement() {
         [ -n "${disk[$k]+set}" ] || disk[$k]=$(storage_avail "$t" "$store")
         [ "${disk[$k]:-0}" -ge "$d" ] 2>/dev/null || { ok=0; break; }
       done <<<"$disks"
-      [ "$ok" = 1 ] && [ "${mem[$t]}" -gt "$bestfree" ] && { best=$t; bestfree=${mem[$t]}; }
+      # A node holding a replica beats any node without one; memory breaks ties.
+      case "$reps" in *" $t "*) isrep=1 ;; *) isrep=0 ;; esac
+      if [ "$ok" = 1 ] && { [ "$isrep" -gt "$bestrep" ] || { [ "$isrep" -eq "$bestrep" ] && [ "${mem[$t]}" -gt "$bestfree" ]; }; }; then
+        best=$t; bestfree=${mem[$t]}; bestrep=$isrep
+      fi
     done
     if [ -z "$best" ]; then
       summary=""
@@ -1073,6 +1077,8 @@ cmd_plan() {
   local n sid rc line
   echo "self: $SELF_NODE    config: $CONF_FILE$([ -r "$CONF_FILE" ] || echo ' (NOT FOUND: start/resume would stop; showing defaults)')"
   echo "nodes: $(cluster_nodes | tr '\n' ' ')"
+  local bad; bad=$(invalid_sids)
+  [ -z "$bad" ] || echo "CONFIG ERROR: guest IDs must look like vm:215 or ct:104, got: $bad(start would refuse to run)"
   if quorum_allows_reboot; then echo "quorum: OK to take one node down"; else echo "quorum: NOT safe - $REASON"; fi
   if ha_in_use; then
     echo "HA: in use; transitions in progress: $(ha_services_in_transition | tr '\n' ' ')"
@@ -1137,8 +1143,19 @@ log_to_file_and_journal() {
 # Running with built-in defaults would mean no notifications, no critical guests and
 # no relocations, so a cycle never starts without its config. Right after a boot the
 # cluster filesystem may not be mounted yet, hence the wait.
+# Guest IDs in the config are HA service IDs ("vm:215", "ct:104"). A bare "215" matches
+# nothing in the HA status, so the guest would be silently skipped; refuse it instead.
+invalid_sids() {
+  local var sid
+  for var in CRITICAL_SIDS PARK_SIDS RELOCATE_SIDS; do
+    declare -n arr=$var
+    for sid in "${arr[@]}"; do [[ "$sid" =~ ^(vm|ct):[0-9]+$ ]] || printf '%s ' "$var=$sid"; done
+    unset -n arr
+  done
+}
+
 require_conf() {
-  local waited=0
+  local waited=0 bad
   until [ -r "$CONF_FILE" ]; do
     if [ "$waited" -ge 300 ]; then
       log "FAILED (nothing changed): no config file found ($SHARED_CONF, $LOCAL_CONF); not running without one"
@@ -1149,6 +1166,12 @@ require_conf() {
     sleep 10; waited=$((waited+10))
     load_conf
   done
+  bad=$(invalid_sids)
+  if [ -n "$bad" ]; then
+    log "FAILED (nothing changed): guest IDs in the config must look like vm:215 or ct:104, got: $bad"
+    record_task failure config "Invalid guest IDs in the config (use vm:215 / ct:104 form): $bad. The cycle did not run."
+    exit 1
+  fi
 }
 
 case "${1:-}" in
